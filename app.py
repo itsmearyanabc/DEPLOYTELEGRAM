@@ -154,6 +154,12 @@ async def async_send_code(api_id, api_hash, phone):
     p_clean = phone.replace('+', '').replace(' ', '').replace('-', '')
     session_name = f"sessions/session_{p_clean}"
     
+    # Clean up any previous pending client for this phone
+    if p_clean in _pending_clients:
+        try: await _pending_clients[p_clean].disconnect()
+        except: pass
+        del _pending_clients[p_clean]
+        
     session_file = f"sessions/session_{p_clean}.session"
     if os.path.exists(session_file):
         try: os.remove(session_file)
@@ -172,8 +178,8 @@ async def async_send_code(api_id, api_hash, phone):
     await client.connect()
     try:
         sent_code = await client.send_code(phone)
-        # DISCONNECT IMMEDIATELY to free the SQLite lock!
-        await client.disconnect()
+        # KEEP alive to verify OTP!
+        _pending_clients[p_clean] = client
         return {"status": "success", "phone_code_hash": sent_code.phone_code_hash}
     except Exception as e:
         await client.disconnect()
@@ -181,33 +187,26 @@ async def async_send_code(api_id, api_hash, phone):
 
 async def async_sign_in(api_id, api_hash, phone, phone_code_hash, code):
     p_clean = phone.replace('+', '').replace(' ', '').replace('-', '')
-    session_name = f"sessions/session_{p_clean}"
     
-    # Create a fresh client instance to read the saved auth key
-    client = Client(
-        session_name, 
-        api_id=int(api_id), 
-        api_hash=api_hash, 
-        workdir=".",
-        device_model="iPhone 15 Pro Max",
-        system_version="iOS 17.5.1",
-        app_version="10.14.1",
-        lang_code="en"
-    )
+    client = _pending_clients.get(p_clean)
+    if not client:
+        return {"status": "error", "message": "Session expired. Click 'Request Code' again."}
     
     try:
-        await client.connect()
         await client.sign_in(phone, phone_code_hash, code)
         me = await client.get_me()
         await client.disconnect()
+        _pending_clients.pop(p_clean, None)
         return {"status": "success", "message": f"Logged in as {me.first_name}"}
     except Exception as e:
         try: await client.disconnect()
         except: pass
+        _pending_clients.pop(p_clean, None)
         session_file = f"sessions/session_{p_clean}.session"
         if os.path.exists(session_file):
             try: os.remove(session_file)
             except: pass
+        return {"status": "error", "message": str(e)}
         return {"status": "error", "message": str(e)}
 
 # --- ROUTES ---
@@ -319,6 +318,16 @@ def start_bot():
     global BOT_PROCESS
     if BOT_PROCESS and BOT_PROCESS.poll() is None:
         return jsonify({"status": "error", "message": "Bot is already running!"})
+    
+    # SAFEGUARD: Forcibly unlock ALL SQLite databases before starting main.py!
+    # If the user requested a code but never signed in, the DB is locked.
+    for phone, client in list(_pending_clients.items()):
+        try:
+            # We must use the background event loop to disconnect async clients
+            run_async(client.disconnect())
+        except:
+            pass
+    _pending_clients.clear()
     
     try:
         # Wrap cache deletion in a try-block to prevent Windows "Access Denied" errors
