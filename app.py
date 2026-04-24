@@ -5,27 +5,48 @@ import shutil
 import time
 import sys
 import asyncio
+import logging
 
-from collections import defaultdict
-from flask import Flask, render_template, request, jsonify, session, redirect, url_for
-from functools import wraps
-from pyrogram import Client
-from werkzeug.security import generate_password_hash, check_password_hash
+# Configure basic logging to stdout for Render
+logging.basicConfig(
+    level=logging.INFO,
+    format='[%(asctime)s] [%(levelname)s] %(message)s',
+    stream=sys.stdout
+)
+logger = logging.getLogger("AppStartup")
+
+try:
+    from collections import defaultdict
+    from flask import Flask, render_template, request, jsonify, session, redirect, url_for
+    from functools import wraps
+    from pyrogram import Client
+    from werkzeug.security import generate_password_hash, check_password_hash
+    logger.info("✅ All dependencies imported successfully")
+except Exception as e:
+    logger.error(f"❌ Failed to import dependencies: {e}")
+    # Don't re-raise yet, let the app object be created if possible
+    pass
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", "ARMEDIAS_PRODUCTION_KEY_2026_SECURE")
 app.config['SESSION_COOKIE_HTTPONLY'] = True
 app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'
 
-# Ensure required directories exist for Render
-for folder in ["sessions", "logs"]:
-    os.makedirs(folder, exist_ok=True)
-
-print("ARMEDIAS App Loading...")
+# Ensure required directories exist
+try:
+    for folder in ["sessions", "logs"]:
+        os.makedirs(folder, exist_ok=True)
+    logger.info("✅ Directories initialized")
+except Exception as e:
+    logger.error(f"❌ Failed to create directories: {e}")
 
 # --- AUTHENTICATION ---
-ADMIN_USER = os.environ.get("ADMIN_USER", "admin")
-_ADMIN_PASS_HASH = generate_password_hash(os.environ.get("ADMIN_PASS", "telegram2026"))
+try:
+    ADMIN_USER = os.environ.get("ADMIN_USER", "admin")
+    _ADMIN_PASS_HASH = generate_password_hash(os.environ.get("ADMIN_PASS", "telegram2026"))
+    logger.info(f"✅ Auth system ready (User: {ADMIN_USER})")
+except Exception as e:
+    logger.error(f"❌ Auth system initialization failed: {e}")
 
 # --- BRUTE FORCE PROTECTION ---
 _login_attempts = defaultdict(list)
