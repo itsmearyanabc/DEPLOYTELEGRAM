@@ -87,7 +87,15 @@ def save_config(config):
     
     raw_targets = config["targets"]
     target_lines = [t.strip() for t in raw_targets.replace('\r\n', '\n').replace('\r', '\n').split('\n')]
-    clean_targets = [t for t in target_lines if t]
+    clean_targets = []
+    for t in target_lines:
+        if not t: continue
+        if t.startswith("http"):
+            t = t.split("/")[-1].split("?")[0]
+        if t.startswith("@"):
+            t = t[1:]
+        clean_targets.append(t)
+
     with open("targets.txt", "w", encoding="utf-8") as f:
         f.write("\n".join(clean_targets) + "\n")
     
@@ -104,7 +112,12 @@ def save_config(config):
     }}""")
     
     accounts_str = ",\n".join(accounts_code)
-    sc = config['source_channel']
+    
+    sc = config['source_channel'].strip()
+    if sc.startswith("http"):
+        sc = sc.split("/")[-1].split("?")[0]
+    if sc.startswith("@"):
+        sc = sc[1:]
     sc_val = sc if sc.lstrip('-').isdigit() else f"'{sc}'"
 
     with open("config.py", "w") as f:
