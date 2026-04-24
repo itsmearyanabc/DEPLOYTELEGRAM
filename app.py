@@ -493,13 +493,20 @@ def logout_account():
 @login_required
 def get_logs():
     log_path = "logs/bot.log"
-    if os.path.exists(log_path):
-        try:
-            with open(log_path, "r") as f:
-                return "".join(f.readlines()[-30:])
-        except Exception:
-            return "Initializing..."
-    return "Ready. Waiting for first message..."
+    if not os.path.exists(log_path):
+        return "Ready. Waiting for first message..."
+        
+    try:
+        # Read only the last 4KB of the file to save memory
+        filesize = os.path.getsize(log_path)
+        with open(log_path, "rb") as f:
+            if filesize > 4096:
+                f.seek(-4096, os.SEEK_END)
+            content = f.read().decode('utf-8', errors='ignore')
+            lines = content.splitlines()
+            return "\n".join(lines[-30:])
+    except Exception as e:
+        return f"Error reading logs: {e}"
 
 
 if __name__ == "__main__":
