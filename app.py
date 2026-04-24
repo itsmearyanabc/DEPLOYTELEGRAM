@@ -319,12 +319,20 @@ def start_bot():
             except: pass
 
         if os.path.exists("logs/bot.log"):
-
             try: os.remove("logs/bot.log")
             except: pass
+
+        # SAFEGUARD: If user forgot to click Save, config.py won't exist and the bot will crash!
+        if not os.path.exists("config.py"):
+            save_config(load_config())
             
-        # We don't need CREATE_NEW_CONSOLE anymore because it won't prompt!
-        BOT_PROCESS = subprocess.Popen([sys.executable, "main.py"])
+        # Redirect output so we can see startup crashes in the dashboard!
+        log_file = open("logs/bot.log", "a")
+        BOT_PROCESS = subprocess.Popen(
+            [sys.executable, "main.py"],
+            stdout=log_file,
+            stderr=subprocess.STDOUT
+        )
         return jsonify({"status": "success", "message": "Automation started in background!"})
     except Exception as e:
         return jsonify({"status": "error", "message": f"Launch failed: {e}"})
