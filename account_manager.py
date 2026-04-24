@@ -22,7 +22,10 @@ class AccountManager:
         """Connect all accounts; skip any that fail auth."""
         import os
         os.makedirs("sessions", exist_ok=True)
-
+        
+        existing_sessions = os.listdir("sessions")
+        logger.info(f"📂 Current session files: {existing_sessions}")
+        
         for config in self.account_configs:
             if MOCK_MODE:
                 await self._mock_init(config)
@@ -57,18 +60,27 @@ class AccountManager:
         Avoids terminal prompts for code — only works if session file exists.
         """
         try:
+            logger.info(f"  🔄 Attempting to initialize {name}...")
             await client.connect()
-            me = await client.get_me()  # Raises if not authorized
+            
+            try:
+                me = await client.get_me()
+                if not me:
+                    raise RuntimeError("get_me() returned None")
+            except Exception as auth_err:
+                logger.error(f"  ❌ {name} is NOT authenticated: {auth_err}")
+                await client.disconnect()
+                return
+
             await client.disconnect()
 
             # Re-start properly so handlers work
             await client.start()
             self.clients.append(client)
-            logger.info(f"  ✅ Authenticated: {name} → {me.first_name} ({me.id})")
+            logger.info(f"  ✅ SUCCESS: {name} authenticated as {me.first_name} (@{me.username or 'no_user'})")
 
         except Exception as e:
-            logger.error(f"  ❌ Auth failed for {name}: {type(e).__name__}: {e}")
-            logger.error("     → Authenticate this account via the Web Panel.")
+            logger.error(f"  ❌ Failed to start {name}: {type(e).__name__}: {e}")
             try:
                 await client.disconnect()
             except Exception:
