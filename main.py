@@ -1,15 +1,14 @@
 import asyncio
+import traceback
+import os
+import sys
 
-# --- FIX FOR PYTHON 3.10+ EVENT LOOP ISSUE ---
+# ── Python 3.10+ event loop fix ──────────────────────────────────────────────
 try:
     asyncio.get_event_loop()
 except RuntimeError:
     asyncio.set_event_loop(asyncio.new_event_loop())
 
-import os
-import sys
-import traceback
-from pyrogram import Client
 from config import ACCOUNTS, TARGETS_FILE, SOURCE_CHANNEL, MOCK_MODE
 from account_manager import AccountManager
 from dispatcher import Dispatcher
@@ -18,93 +17,110 @@ from logger import logger
 
 
 def load_targets(filepath: str) -> list:
-    """Load target usernames/phone numbers from file."""
+    """Load and normalise targets from file. Converts numeric IDs to int."""
     if not os.path.exists(filepath):
-        logger.error(f"Targets file not found: {filepath}")
+        logger.error(f"❌ Targets file not found: {filepath}")
         return []
 
     targets = []
     with open(filepath, "r", encoding="utf-8") as f:
-        for line in f:
-            # Strip all whitespace including \r and \n
-            line = line.strip()
-            if line and not line.startswith("#"):
-                # Convert numeric IDs (like -100xxx) to integers
-                if line.lstrip('-').isdigit():
-                    targets.append(int(line))
-                else:
-                    targets.append(line)
+        for raw_line in f:
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            # Convert numeric IDs (positive or negative) to int
+            if line.lstrip("-").isdigit():
+                targets.append(int(line))
+            else:
+                # Strip leading @ if present
+                targets.append(line.lstrip("@"))
 
     if not targets:
-        logger.error("No targets found in targets.txt!")
+        logger.error("❌ No valid targets found in targets.txt!")
         return []
 
-    logger.info(f"Loaded {len(targets)} targets from {filepath}")
+    logger.info(f"✅ Loaded {len(targets)} target(s):")
     for t in targets:
-        logger.info(f"  Target: {t}")
+        logger.info(f"    → {t}")
     return targets
 
 
 async def main():
-    logger.info("=" * 55)
-    logger.info("   TELEGRAM BULK MESSENGER — Starting Up")
-    logger.info("=" * 55)
+    logger.info("=" * 60)
+    logger.info("   ARMEDIAS TELEGRAM FORWARDER — Starting Up")
+    logger.info("=" * 60)
 
-    # 1. Load targets
+    # ── 1. Load targets ───────────────────────────────────────────────────────
     targets = load_targets(TARGETS_FILE)
     if not targets:
-        logger.error("No valid targets. Please add targets in the Admin Panel and restart.")
+        logger.error("No valid targets. Add targets in the Admin Panel and restart.")
         return
 
-    # 2. Initialize account manager (logs in all sender accounts)
+    # ── 2. Init accounts ──────────────────────────────────────────────────────
     account_manager = AccountManager()
-    await account_manager.initialize()
+    try:
+        await account_manager.initialize()
+    except RuntimeError as e:
+        logger.error(f"Startup failed: {e}")
+        return
 
-    # 3. Set up dispatcher with the target list
+    # ── 3. Build dispatcher ───────────────────────────────────────────────────
     dispatcher = Dispatcher(account_manager, targets)
 
-    # 4. Handle Mock vs Real Monitor
+    # ── 4. Mock mode (for stress-testing only) ────────────────────────────────
     if MOCK_MODE:
-        logger.info("🛠️  MOCK MODE: Injecting a test message to start the demo...")
-        # Inject a fake message data
-        fake_message = {
-            "from_chat_id": 123456789,
-            "message_id": 1
-        }
-        await dispatcher.enqueue(fake_message)
-        
+        logger.info("🛠️  MOCK MODE active. Injecting test messages...")
+        for i in range(1, 4):
+            await dispatcher.enqueue({
+                "from_chat_id": 123456789,
+                "message_id": i,
+                "text": f"Test message {i}"
+            })
+
         try:
             await dispatcher.run()
         except (KeyboardInterrupt, asyncio.CancelledError):
             pass
-    else:
-        # Real production mode
-        # Reuse the FIRST client already started by account_manager
-        # This avoids the "sqlite3.OperationalError: database is locked" error
-        monitor_client = account_manager.clients[0]
-        
-        logger.info(f"Monitor client active. Watching: {SOURCE_CHANNEL}")
-        monitor = Monitor(monitor_client, dispatcher)
-        
-        # Diagnostic: List all channels we can see
-        await monitor.list_channels()
-        
-        # Start dispatcher in the background
-        dispatcher_task = asyncio.create_task(dispatcher.run())
-        
-        try:
-            # idle() keeps the script running and listening for events
-            from pyrogram import idle
-            await idle()
-        except (KeyboardInterrupt, asyncio.CancelledError):
-            pass
         finally:
             dispatcher.stop()
-            await dispatcher_task
+            await account_manager.stop_all()
+        return
 
-    # 5. Shutdown
-    await account_manager.stop_all()
-    logger.info("Bot stopped cleanly.")
+    # ── 5. Production mode ────────────────────────────────────────────────────
+    # Use the FIRST already-started client as the monitor
+    monitor_client = account_manager.clients[0]
+    logger.info(f"👁️  Monitor using client: {monitor_client.name}")
+
+    monitor = Monitor(monitor_client, dispatcher)
+
+    # Diagnostic: print all visible channels
+    await monitor.list_channels()
+
+    # Start dispatcher as a background task
+    dispatcher_task = asyncio.create_task(dispatcher.run())
+
+    try:
+        from pyrogram import idle
+        logger.info("✅ Bot fully operational. Listening for messages...")
+        await idle()
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        logger.info("Shutdown signal received.")
+    except Exception as e:
+        logger.error(f"❌ Idle error: {e}")
+        logger.error(traceback.format_exc())
+    finally:
+        logger.info("Shutting down...")
+        dispatcher.stop()
+
+        # Cancel dispatcher task cleanly
+        dispatcher_task.cancel()
+        try:
+            await dispatcher_task
+        except asyncio.CancelledError:
+            pass
+
+        await account_manager.stop_all()
+        logger.info("✅ Bot stopped cleanly.")
 
 
 if __name__ == "__main__":
@@ -112,11 +128,12 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         print("\nBot interrupted by user.")
-    except Exception as e:
-        print("\n" + "=" * 55)
-        print("❌ BOT CRASHED WITH ERROR:")
-        print("=" * 55)
+    except Exception:
+        print("\n" + "=" * 60)
+        print("❌ BOT CRASHED:")
+        print("=" * 60)
         traceback.print_exc()
-        print("=" * 55)
+        print("=" * 60)
+        sys.exit(1)
     finally:
         print("\nBot has stopped.")

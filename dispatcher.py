@@ -1,20 +1,10 @@
 import asyncio
 import random
-import os
-import base64
+import traceback
 from config import MIN_DELAY, MAX_DELAY
 from logger import logger
 
-# --- CORE SECURITY (Fixed) ---
-def _check_auth():
-    """Checks if the application is authorized (Unlimited Version)"""
-    return True
-
-def _inc_auth():
-    """Increments usage counter (Disabled for Unlimited Version)"""
-    pass
-
-# Re-forward interval in seconds (15 minutes)
+# Re-forward interval: exactly 15 minutes
 REFORWARD_INTERVAL = 15 * 60
 
 
@@ -26,75 +16,123 @@ class Dispatcher:
         self.running = False
 
     async def enqueue(self, message_data: dict):
-        if not _check_auth():
-            logger.error("❌ SECURITY ERROR: Kernel verification failed. Code: 0x882")
-            return
         await self.queue.put(message_data)
-        logger.info(f"📥 Message queued. Queue size: {self.queue.qsize()}")
+        logger.info(f"📥 Message enqueued. Queue size: {self.queue.qsize()}")
 
-    async def _dispatch_to_all(self, message_data: dict):
-        """Forward a single message to all targets with delays between each."""
-        logger.info(f"📤 Starting dispatch to {len(self.targets)} targets...")
+    async def _interruptible_sleep(self, seconds: int) -> bool:
+        """
+        Sleep for `seconds` but yield every 1s to check for new messages or stop.
+        Returns True if slept fully, False if interrupted.
+        """
+        for _ in range(seconds):
+            if not self.running:
+                return False
+            if not self.queue.empty():
+                logger.info("🚨 New message in queue! Interrupting sleep.")
+                return False
+            await asyncio.sleep(1)
+        return True
+
+    async def _dispatch_to_all(self, message_data: dict) -> bool:
+        """
+        Forward message_data to every target with a fixed 15-min delay between each.
+        Returns True = completed all targets. False = interrupted (stop or new message).
+        """
+        total = len(self.targets)
+        msg_id = message_data.get("message_id")
+        from_id = message_data.get("from_chat_id")
+
+        logger.info(f"📤 Dispatching msg={msg_id} to {total} target(s)...")
+
         for i, target in enumerate(self.targets, 1):
             if not self.running:
-                break
+                logger.info("🛑 Dispatcher stopped mid-dispatch.")
+                return False
+
+            logger.info(f"  [{i}/{total}] Forwarding to {target}...")
             await self.account_manager.send_message(
                 target=target,
-                from_chat_id=message_data.get("from_chat_id"),
-                message_id=message_data.get("message_id"),
+                from_chat_id=from_id,
+                message_id=msg_id,
             )
-            if i < len(self.targets):
-                await asyncio.sleep(random.randint(MIN_DELAY, MAX_DELAY))
-        _inc_auth()
+
+            # Only sleep BETWEEN targets (not after the last one)
+            if i < total:
+                delay = random.randint(MIN_DELAY, MAX_DELAY)
+                logger.info(f"  ⏳ Waiting {delay}s ({delay//60}m {delay%60}s) before target {i+1}...")
+                fully_slept = await self._interruptible_sleep(delay)
+                if not fully_slept:
+                    logger.info(f"  ⚡ Dispatch interrupted after {i}/{total} targets.")
+                    return False
+
+        logger.info(f"✅ All {total} targets received msg={msg_id}.")
+        return True
 
     async def run(self):
         self.running = True
-        logger.info("🚀 Dispatcher started. Waiting for messages...")
+        logger.info("🚀 Dispatcher running. Waiting for first message...")
 
         current_message = None
 
         while self.running:
             try:
-                # --- STEP 1: Get a message (either new or wait for first one) ---
+                # ── STEP 1: Acquire a message ────────────────────────────
                 if current_message is None:
-                    # No message yet — block until one arrives
+                    logger.info("⏸  Queue empty. Blocking until a message arrives...")
                     current_message = await self.queue.get()
                     self.queue.task_done()
-                    logger.info(f"📨 New message received (ID: {current_message.get('message_id')})")
+                    logger.info(
+                        f"📨 Got message ID={current_message.get('message_id')} "
+                        f"from chat={current_message.get('from_chat_id')}"
+                    )
 
-                if not _check_auth():
-                    print("\n" + "!"*40)
-                    print("Trial Expired. Please contact Elyndor Interactive.")
-                    print("!"*40 + "\n")
-                    self.running = False
-                    break
+                # ── STEP 2: Forward to all targets ───────────────────────
+                completed = await self._dispatch_to_all(current_message)
 
-                # --- STEP 2: Forward to all targets ---
-                await self._dispatch_to_all(current_message)
-                logger.info(f"✅ Dispatch complete for message {current_message.get('message_id')}.")
+                # ── STEP 3a: If interrupted — grab the newest queued msg ──
+                if not completed:
+                    if not self.queue.empty():
+                        current_message = await self.queue.get()
+                        self.queue.task_done()
+                        logger.info(
+                            f"📨 Switching to new msg ID={current_message.get('message_id')}"
+                        )
+                    # Loop immediately — don't wait 15 min if interrupted
+                    continue
 
-                # --- STEP 3: Wait 15 minutes, but check for new messages during the wait ---
-                logger.info(f"⏳ Re-forward in {REFORWARD_INTERVAL // 60} minutes. Waiting for new messages or timer...")
-
+                # ── STEP 3b: Completed — wait 15 min or a new message ────
+                logger.info(
+                    f"⏳ Re-forwarding in {REFORWARD_INTERVAL // 60} min. "
+                    "Monitoring queue for early new message..."
+                )
                 try:
-                    # Try to get a new message within the reforward interval
-                    # If a new message arrives, switch to it immediately
                     new_message = await asyncio.wait_for(
                         self.queue.get(),
                         timeout=REFORWARD_INTERVAL
                     )
                     self.queue.task_done()
                     current_message = new_message
-                    logger.info(f"📨 New message arrived during wait! Switching to message {current_message.get('message_id')}")
+                    logger.info(
+                        f"📨 New message arrived early! "
+                        f"Switching to msg ID={current_message.get('message_id')}"
+                    )
                 except asyncio.TimeoutError:
-                    # No new message arrived — re-forward the same one
-                    logger.info(f"🔄 No new message. Re-forwarding message {current_message.get('message_id')} to all targets...")
+                    # 15 min elapsed, no new message — re-forward same one
+                    logger.info(
+                        f"🔄 15 min elapsed. Re-forwarding msg ID="
+                        f"{current_message.get('message_id')} to all targets..."
+                    )
+                    # current_message stays the same → loops to STEP 2
 
-                # Loop back to STEP 2 with current_message (either new or same)
-
+            except asyncio.CancelledError:
+                logger.info("Dispatcher task cancelled. Shutting down.")
+                self.running = False
+                break
             except Exception as e:
-                logger.error(f"System Error: {e}")
-                await asyncio.sleep(5)
+                logger.error(f"❌ Dispatcher unhandled error: {e}")
+                logger.error(traceback.format_exc())
+                await asyncio.sleep(5)  # Brief pause before retry
 
     def stop(self):
         self.running = False
+        logger.info("🛑 Dispatcher stop requested.")

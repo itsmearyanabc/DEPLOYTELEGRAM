@@ -7,10 +7,16 @@ import sys
 import asyncio
 
 # --- FIX FOR RENDER/GUNICORN EVENT LOOP ISSUE ---
-try:
-    asyncio.get_event_loop()
-except RuntimeError:
-    asyncio.set_event_loop(asyncio.new_event_loop())
+# Each thread needs its own loop; don't share loops across threads
+import threading
+_thread_local = threading.local()
+
+def _get_or_create_loop():
+    loop = getattr(_thread_local, 'loop', None)
+    if loop is None or loop.is_closed():
+        loop = asyncio.new_event_loop()
+        _thread_local.loop = loop
+    return loop
 
 from collections import defaultdict
 from flask import Flask, render_template, request, jsonify, session, redirect, url_for
@@ -75,10 +81,10 @@ def load_config():
         with open(CONFIG_FILE, "r") as f:
             return json.load(f)
     return {
-        "api_id": "", "api_hash": "", 
-        "phones": "", 
+        "api_id": "", "api_hash": "",
+        "phones": "",
         "source_channel": "", "targets": "",
-        "min_delay": 600, "max_delay": 900
+        "min_delay": 900, "max_delay": 900
     }
 
 def save_config(config):
@@ -120,6 +126,10 @@ def save_config(config):
         sc = sc[1:]
     sc_val = sc if sc.lstrip('-').isdigit() else f"'{sc}'"
 
+    # Clamp delays: minimum 60s each, max_delay >= min_delay
+    min_d = max(60, int(config.get('min_delay', 900)))
+    max_d = max(min_d, int(config.get('max_delay', 900)))
+
     with open("config.py", "w") as f:
         f.write(f"""# AUTO-GENERATED CONFIG - {time.ctime()}
 MOCK_MODE = False
@@ -127,23 +137,16 @@ ACCOUNTS = [
 {accounts_str}
 ]
 SOURCE_CHANNEL = {sc_val}
-MIN_DELAY = {config['min_delay']}
-MAX_DELAY = {config['max_delay']}
+MIN_DELAY = {min_d}
+MAX_DELAY = {max_d}
 TARGETS_FILE = "targets.txt"
 LOG_FILE = "bot.log"
 """)
 
 # --- ASYNC HELPERS ---
-# Keep a persistent event loop for async operations
-_auth_loop = None
-def get_auth_loop():
-    global _auth_loop
-    if _auth_loop is None or _auth_loop.is_closed():
-        _auth_loop = asyncio.new_event_loop()
-    return _auth_loop
-
 def run_async(coro):
-    loop = get_auth_loop()
+    """Run a coroutine in the thread-local event loop."""
+    loop = _get_or_create_loop()
     return loop.run_until_complete(coro)
 
 # Store active Client instances between send_code and sign_in
@@ -206,7 +209,6 @@ async def async_sign_in(api_id, api_hash, phone, phone_code_hash, code):
         if os.path.exists(session_file):
             try: os.remove(session_file)
             except: pass
-        return {"status": "error", "message": str(e)}
         return {"status": "error", "message": str(e)}
 
 # --- ROUTES ---
@@ -299,12 +301,12 @@ def api_sign_in():
 def save():
     try:
         config = {
-            "api_id": request.form.get("api_id"),
-            "api_hash": request.form.get("api_hash"),
-            "phones": request.form.get("phones"),
-            "source_channel": request.form.get("source_channel"),
-            "targets": request.form.get("targets"),
-            "min_delay": int(request.form.get("min_delay", 600)),
+            "api_id": request.form.get("api_id", "").strip(),
+            "api_hash": request.form.get("api_hash", "").strip(),
+            "phones": request.form.get("phones", "").strip(),
+            "source_channel": request.form.get("source_channel", "").strip(),
+            "targets": request.form.get("targets", "").strip(),
+            "min_delay": int(request.form.get("min_delay", 900)),
             "max_delay": int(request.form.get("max_delay", 900))
         }
         save_config(config)

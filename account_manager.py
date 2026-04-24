@@ -1,9 +1,15 @@
 import asyncio
 import itertools
+import traceback
 from pyrogram import Client
-from pyrogram.errors import FloodWait, PeerFlood, UserPrivacyRestricted, RPCError
+from pyrogram.errors import (
+    FloodWait, PeerFlood, UserPrivacyRestricted,
+    ChatWriteForbidden, ChannelPrivate, UserBannedInChannel,
+    RPCError, SlowmodeWait, ChatAdminRequired, UserNotParticipant
+)
 from logger import logger
 from config import MOCK_MODE
+
 
 class AccountManager:
     def __init__(self):
@@ -13,14 +19,13 @@ class AccountManager:
         self._cycle = None
 
     async def initialize(self):
-        """Log in to all configured accounts."""
+        """Connect all accounts; skip any that fail auth."""
         import os
         os.makedirs("sessions", exist_ok=True)
-        
-        tasks = []
+
         for config in self.account_configs:
             if MOCK_MODE:
-                tasks.append(asyncio.create_task(self._mock_init(config)))
+                await self._mock_init(config)
                 continue
 
             clean_phone = config["phone"].replace(" ", "").replace("-", "")
@@ -32,108 +37,149 @@ class AccountManager:
                 device_model="iPhone 15 Pro Max",
                 system_version="iOS 17.5.1",
                 app_version="10.14.1",
-                lang_code="en"
+                lang_code="en",
+                workdir="."
             )
-            # Trigger code request
-            tasks.append(asyncio.create_task(self._start_client_safely(client, config['name'])))
-            
-            # SMALL DELAY: Prevents Telegram from blocking simultaneous requests
-            await asyncio.sleep(5)
-
-        # Ensure all tasks are gathered
-        await asyncio.gather(*tasks)
+            await self._start_client_safely(client, config["name"])
+            # Small gap to avoid simultaneous Telegram auth requests
+            await asyncio.sleep(3)
 
         if not self.clients:
-            logger.error("No accounts could be initialized. Check config.py.")
+            logger.error("❌ FATAL: No accounts could be initialized. Check config and session files.")
             raise RuntimeError("No accounts could be initialized.")
 
         self._cycle = itertools.cycle(self.clients)
-        logger.info(f"Account pool ready with {len(self.clients)} account(s).")
+        logger.info(f"✅ Account pool ready: {len(self.clients)} account(s) active.")
 
-    async def _start_client_safely(self, client, name):
-        """Helper to start client and add to pool without terminal prompts."""
+    async def _start_client_safely(self, client: Client, name: str):
+        """
+        Connect → verify auth → then start() for event listening.
+        Avoids terminal prompts for code — only works if session file exists.
+        """
         try:
-            # Step 1: Raw connection to check auth status silently
             await client.connect()
-            me = await client.get_me() # Raises error if not authorized
+            me = await client.get_me()  # Raises if not authorized
             await client.disconnect()
 
-            # Step 2: Since we know it's authorized, start() will NOT prompt for code
-            # start() is required to initialize the message listener!
+            # Re-start properly so handlers work
             await client.start()
             self.clients.append(client)
-            logger.info(f"  ✅ Logged in as: {name} ({me.first_name})")
+            logger.info(f"  ✅ Authenticated: {name} → {me.first_name} ({me.id})")
+
         except Exception as e:
-            logger.error(f"  ❌ Auth Error for {name}: {type(e).__name__}: {e}")
-            logger.error(f"     → Please authenticate this account in the Web Panel.")
-            try: await client.disconnect() 
-            except: pass
+            logger.error(f"  ❌ Auth failed for {name}: {type(e).__name__}: {e}")
+            logger.error("     → Authenticate this account via the Web Panel.")
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
+
     async def _mock_init(self, config):
-        """Helper for mock parallel init."""
-        client = type('MockClient', (), {
-            'name': config['session_name'],
-            'forward_messages': self._mock_forward,
-            'start': lambda: None,
-            'stop': lambda: None
+        """Fake client for stress/mock tests."""
+        client = type("MockClient", (), {
+            "name": config["session_name"],
+            "forward_messages": self._mock_forward,
+            "start": lambda: None,
+            "stop": lambda: None,
         })
         self.clients.append(client)
         logger.info(f"  ✅ [MOCK] Loaded: {config['name']}")
 
     async def _mock_forward(self, *args, **kwargs):
-        """Helper for MOCK_MODE stress testing."""
+        """Simulate random Telegram errors in mock mode."""
         import random
-        from pyrogram.errors import FloodWait, PeerFlood
-        chaos_factor = random.random()
-        if chaos_factor < 0.2:
+        chaos = random.random()
+        if chaos < 0.15:
             raise FloodWait(30)
-        elif chaos_factor < 0.4:
+        elif chaos < 0.30:
             raise PeerFlood()
-        await asyncio.sleep(0.1)
+        await asyncio.sleep(0.05)
 
     def next_client(self) -> Client:
         return next(self._cycle)
 
-    async def send_message(self, target: str, from_chat_id: int, message_id: int, retries=2) -> bool:
-        """Forward message with advanced error handling and account skipping."""
+    async def send_message(
+        self,
+        target: str,
+        from_chat_id: int,
+        message_id: int,
+    ) -> bool:
+        """
+        Forward a message to a target, trying every account before giving up.
+        Skips accounts that are FloodWait'd, Restricted, or Banned.
+        """
         if not self.clients:
+            logger.error("❌ No clients available to send messages.")
             return False
 
-        # Try multiple accounts if one fails
-        for attempt in range(len(self.clients)):
+        num_accounts = len(self.clients)
+
+        for attempt in range(num_accounts):
             client = self.next_client()
-            acc_info = f"Acc_{client.name.split('_')[-1]}"
+            acc_tag = f"[{client.name.split('_')[-1]}]"
 
             try:
                 await client.forward_messages(
                     chat_id=target,
                     from_chat_id=from_chat_id,
-                    message_ids=message_id
+                    message_ids=message_id,
                 )
-                logger.info(f"  [{acc_info}] ✅ Success -> {target}")
+                logger.info(f"  {acc_tag} ✅ Forwarded → {target}")
                 return True
 
             except FloodWait as e:
-                logger.warning(f"  [{acc_info}] ⚠️ FloodWait ({e.value}s). Skipping to next account...")
-                continue # Try next account immediately
-            
+                logger.warning(
+                    f"  {acc_tag} ⚠️  FloodWait {e.value}s for {target}. "
+                    "Trying next account..."
+                )
+                continue
+
+            except SlowmodeWait as e:
+                logger.warning(
+                    f"  {acc_tag} ⚠️  SlowmodeWait {e.value}s for {target}. "
+                    "Trying next account..."
+                )
+                continue
+
             except (PeerFlood, UserPrivacyRestricted):
-                logger.warning(f"  [{acc_info}] 🚫 Restricted or Privacy Blocked for {target}. Skipping...")
-                continue # Try next account
-            
+                logger.warning(
+                    f"  {acc_tag} 🚫 PeerFlood/Privacy for {target}. "
+                    "Trying next account..."
+                )
+                continue
+
+            except (ChatWriteForbidden, ChannelPrivate, UserBannedInChannel,
+                    ChatAdminRequired, UserNotParticipant) as e:
+                # These are target-level problems — no point retrying same target
+                logger.error(
+                    f"  {acc_tag} 🔒 Target {target} is unreachable: "
+                    f"{type(e).__name__}. Skipping target entirely."
+                )
+                return False  # Skip this target, move to next
+
             except RPCError as e:
-                logger.error(f"  [{acc_info}] ❌ Telegram Error: {e.MESSAGE}. Skipping...")
+                logger.error(
+                    f"  {acc_tag} ❌ RPC Error for {target}: "
+                    f"[{e.ID}] {e.MESSAGE}"
+                )
                 continue
 
             except Exception as e:
-                logger.error(f"  [{acc_info}] ❌ Unexpected Error: {e}")
+                logger.error(
+                    f"  {acc_tag} ❌ Unexpected error for {target}: "
+                    f"{type(e).__name__}: {e}"
+                )
+                logger.error(traceback.format_exc())
                 continue
 
-        logger.error(f"  🔥 All accounts failed to deliver to {target}.")
+        logger.error(f"  🔥 All {num_accounts} accounts failed for {target}. Message NOT sent.")
         return False
 
     async def stop_all(self):
+        """Gracefully stop all running clients."""
         for client in self.clients:
             try:
                 await client.stop()
-            except:
+            except Exception:
                 pass
+        logger.info("All accounts disconnected.")
