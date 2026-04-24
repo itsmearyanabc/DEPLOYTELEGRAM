@@ -6,17 +6,35 @@ import time
 import sys
 import asyncio
 
-# --- FIX FOR RENDER/GUNICORN EVENT LOOP ISSUE ---
-# Each thread needs its own loop; don't share loops across threads
+# --- FIX FOR RENDER/GUNICORN: Persistent background event loop ---
+# Gunicorn workers have no default event loop in Python 3.10+.
+# The ONLY reliable fix: one daemon thread owns a persistent loop forever.
+# All async work is submitted to it via run_coroutine_threadsafe().
 import threading
-_thread_local = threading.local()
 
-def _get_or_create_loop():
-    loop = getattr(_thread_local, 'loop', None)
-    if loop is None or loop.is_closed():
-        loop = asyncio.new_event_loop()
-        _thread_local.loop = loop
-    return loop
+_bg_loop: asyncio.AbstractEventLoop = None
+_bg_thread: threading.Thread = None
+_bg_loop_lock = threading.Lock()
+
+def _start_background_loop(loop: asyncio.AbstractEventLoop):
+    asyncio.set_event_loop(loop)
+    loop.run_forever()
+
+def _ensure_bg_loop():
+    global _bg_loop, _bg_thread
+    with _bg_loop_lock:
+        if _bg_loop is None or _bg_loop.is_closed():
+            _bg_loop = asyncio.new_event_loop()
+            _bg_thread = threading.Thread(
+                target=_start_background_loop,
+                args=(_bg_loop,),
+                daemon=True,
+                name="AsyncBgLoop"
+            )
+            _bg_thread.start()
+
+# Start immediately on module load so the loop is ready before any request
+_ensure_bg_loop()
 
 from collections import defaultdict
 from flask import Flask, render_template, request, jsonify, session, redirect, url_for
@@ -145,9 +163,13 @@ LOG_FILE = "bot.log"
 
 # --- ASYNC HELPERS ---
 def run_async(coro):
-    """Run a coroutine in the thread-local event loop."""
-    loop = _get_or_create_loop()
-    return loop.run_until_complete(coro)
+    """
+    Submit a coroutine to the persistent background event loop and block
+    until it completes. Safe to call from any Gunicorn worker thread.
+    """
+    _ensure_bg_loop()
+    future = asyncio.run_coroutine_threadsafe(coro, _bg_loop)
+    return future.result(timeout=120)  # 2-min timeout for OTP flows
 
 # Store active Client instances between send_code and sign_in
 # so the SAME auth key is used for both operations
