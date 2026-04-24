@@ -87,7 +87,8 @@ async def main():
         
         try:
             # idle() keeps the script running and listening for events
-            await monitor_client.idle()
+            from pyrogram import idle
+            await idle()
         except (KeyboardInterrupt, asyncio.CancelledError):
             pass
         finally:
