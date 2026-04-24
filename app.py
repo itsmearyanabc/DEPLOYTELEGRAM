@@ -7,7 +7,14 @@ import sys
 import asyncio
 import logging
 
-# Configure basic logging to stdout for Render
+# CRITICAL FIX FOR RENDER/GUNICORN: Ensure an event loop exists BEFORE any imports.
+# Some libraries (like Pyrogram) may try to access the current loop on import.
+try:
+    asyncio.get_event_loop()
+except RuntimeError:
+    asyncio.set_event_loop(asyncio.new_event_loop())
+
+# Configure basic logging
 logging.basicConfig(
     level=logging.INFO,
     format='[%(asctime)s] [%(levelname)s] %(message)s',
