@@ -40,9 +40,9 @@ class Monitor:
 
         async def on_new_post(client: Client, message: Message):
             try:
+                # Basic logging for any message that passes the filter
                 logger.info(
-                    f"📡 New post detected! "
-                    f"chat_id={message.chat.id} | "
+                    f"📡 [FILTERED] New post in source channel! "
                     f"msg_id={message.id} | "
                     f"type={message.media or 'text'}"
                 )
@@ -59,9 +59,28 @@ class Monitor:
                 logger.error(f"❌ Monitor handler error: {e}")
                 logger.error(traceback.format_exc())
 
-        # Filter to only the configured source channel
+        async def raw_debug_handler(client: Client, message: Message):
+            """Log ID of EVERY message seen to help find the correct SOURCE_CHANNEL."""
+            try:
+                # Log only once per chat to avoid spamming
+                if not hasattr(self, "_seen_chats"):
+                    self._seen_chats = set()
+                
+                if message.chat.id not in self._seen_chats:
+                    logger.info(f"🔍 DEBUG: Bot just saw a message from Chat ID: {message.chat.id} ({message.chat.title or 'Private'})")
+                    self._seen_chats.add(message.chat.id)
+            except:
+                pass
+
+        # 1. Raw Debug Handler (catch all)
+        self.client.add_handler(MessageHandler(raw_debug_handler), group=-1)
+
+        # 2. Main Filtered Handler
+        # We combine chat filter with channel/group filters to be safe
+        chat_filter = filters.chat(SOURCE_CHANNEL)
+        
         self.client.add_handler(
-            MessageHandler(on_new_post, filters.chat(SOURCE_CHANNEL))
+            MessageHandler(on_new_post, chat_filter)
         )
         logger.info(f"👂 Listening for posts in: {SOURCE_CHANNEL}")
 
